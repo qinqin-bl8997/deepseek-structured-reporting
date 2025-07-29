@@ -1,0 +1,131 @@
+# 加载必要的包
+library(dplyr)  # 用于数据处理和连接
+library(MLmetrics)  # 用于计算F1值（若未安装，会自动安装）
+
+# --------------------------
+# 1. 读取数据
+# --------------------------
+# 读取真实值文件（ys.txt）
+ys_data <- read.delim(
+    "ys.txt", 
+    sep = "\t",  # 假设使用制表符分隔，若为逗号可改为sep = ","
+    stringsAsFactors = FALSE,
+    na.strings = ""  # 将空字符串视为NA
+)
+
+# 读取预测值文件（DeepSeekPE.txt）
+huatuo_data <- read.delim(
+    "DeepSeekPE.txt",  # 修改为新文件名
+    sep = "\t", 
+    stringsAsFactors = FALSE,
+    na.strings = ""
+)
+
+# --------------------------
+# 2. 数据预处理与连接
+# --------------------------
+# 检查必要的列是否存在
+if (!"study_id" %in% colnames(ys_data)) {
+    stop("ys.txt中未找到study_id列，请检查列名是否正确")
+}
+if (!"pleural_effusion" %in% colnames(ys_data)) {
+    stop("ys.txt中未找到pleural_effusion列，请检查列名是否正确")
+}
+if (!"study_id" %in% colnames(huatuo_data)) {
+    stop("DeepSeekPE.txt中未找到study_id列，请检查列名是否正确")
+}
+if (!"Dpleural_effusion" %in% colnames(huatuo_data)) {  # 修改为新列名
+    stop("DeepSeekPE.txt中未找到Dpleural_effusion列，请检查列名是否正确")
+}
+
+# 基于study_id进行内连接（只保留两个文件都存在的样本）
+merged_data <- inner_join(
+    ys_data %>% select(study_id, pleural_effusion),
+    huatuo_data %>% select(study_id, Hpleural_effusion = Dpleural_effusion),  # 重命名列
+    by = "study_id"
+)
+
+# 查看连接结果基本信息
+cat("内连接后样本量：", nrow(merged_data), "\n")
+cat("原始真实值样本量：", nrow(ys_data), "\n")
+cat("原始预测值样本量：", nrow(huatuo_data), "\n")
+
+# --------------------------
+# 3. 处理不需要评价的样本（真实值为空格）
+# --------------------------
+# 将真实值中为空格（或空字符串）的样本标记为不需要评价
+merged_data <- merged_data %>%
+    mutate(
+        pleural_effusion = trimws(pleural_effusion),  # 去除首尾空格
+        # 筛选出需要评价的样本（真实值不为空且不是纯空格）
+        to_evaluate = !(pleural_effusion %in% c("", " "))
+    )
+
+# 提取需要评价的样本
+eval_data <- merged_data %>%
+    filter(to_evaluate) %>%
+    select(study_id, true_label = pleural_effusion, pred_label = Hpleural_effusion)
+
+cat("需要评价的样本量：", nrow(eval_data), "\n")
+cat("不需要评价的样本量（真实值为空格）：", sum(!merged_data$to_evaluate), "\n")
+
+# --------------------------
+# 4. 统一标签格式（转换为二分类0/1）
+# --------------------------
+# 假设真实值和预测值的可能取值为："是"/"否"、"1"/"0"、"存在"/"不存在"等
+# 这里统一转换为1（存在）和0（不存在）
+eval_data <- eval_data %>%
+    mutate(
+        # 处理真实标签
+        true_label = case_when(
+            true_label %in% c("是", "1", "存在", "有") ~ 1,
+            true_label %in% c("否", "0", "不存在", "无") ~ 0,
+            TRUE ~ NA_integer_  # 无法识别的标签标记为NA
+        ),
+        # 处理预测标签
+        pred_label = case_when(
+            pred_label %in% c("是", "1", "存在", "有") ~ 1,
+            pred_label %in% c("否", "0", "不存在", "无") ~ 0,
+            TRUE ~ NA_integer_  # 无法识别的标签标记为NA
+        )
+    )
+
+# 检查并移除含NA的样本（无法识别的标签）
+na_count <- sum(is.na(eval_data$true_label) | is.na(eval_data$pred_label))
+if (na_count > 0) {
+    eval_data <- eval_data %>%
+        filter(!is.na(true_label), !is.na(pred_label))
+    cat("包含无法识别标签的样本量（已移除）：", na_count, "\n")
+    cat("有效评价样本量：", nrow(eval_data), "\n")
+}
+
+# 确保标签是二分类（0/1）
+if (!all(eval_data$true_label %in% c(0, 1)) || !all(eval_data$pred_label %in% c(0, 1))) {
+    stop("标签转换后仍存在非0/1的值，请检查原始标签格式并调整转换规则")
+}
+
+# --------------------------
+# 5. 计算F1值
+# --------------------------
+# 安装并加载MLmetrics包（若未安装）
+if (!requireNamespace("MLmetrics", quietly = TRUE)) {
+    install.packages("MLmetrics")
+}
+library(MLmetrics)
+
+# 计算F1值（默认使用binary F1，适用于二分类）
+f1_score <- F1_Score(
+    y_true = eval_data$true_label,
+    y_pred = eval_data$pred_label,
+    positive = 1  # 正例为"存在胸腔积液"（1）
+)
+
+# 输出结果
+cat("\n===== 预测性能评估 =====", "\n")
+cat(sprintf("F1值：%.4f", f1_score), "\n")
+
+# 可选：输出混淆矩阵
+conf_matrix <- table(真实值 = eval_data$true_label, 预测值 = eval_data$pred_label)
+cat("\n混淆矩阵：\n")
+print(conf_matrix)
+

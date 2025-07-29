@@ -1,0 +1,129 @@
+# 加载所需库
+library(httr)    # 发送HTTP请求
+library(jsonlite) # 处理JSON数据
+
+# 定义调用DeepSeek API的函数（判断单份报告）
+check_atelectasis <- function(report_content, api_key, model = "deepseek-chat") {
+  api_url <- "https://api.deepseek.com/v1/chat/completions"
+  
+  # 构建提示词
+  prompt <- paste0(
+    "请分析以下胸片报告内容，判断是否存在肺不张（atelectasis）的诊断。\n",
+    "仅需返回'是'或'否'，不添加任何额外解释。\n\n",
+    "报告内容：\n", report_content
+  )
+  
+  payload <- list(
+    model = model,
+    messages = list(
+      list(role = "system", content = "你是放射科医生，擅长识别肺不张（atelectasis）诊断。"),
+      list(role = "user", content = prompt)
+    ),
+    temperature = 0.0,
+    max_tokens = 10
+  )
+  
+  tryCatch({
+    response <- POST(
+      url = api_url,
+      add_headers(
+        "Content-Type" = "application/json",
+        "Authorization" = paste("Bearer", api_key)
+      ),
+      body = toJSON(payload, auto_unbox = TRUE),
+      timeout(30)
+    )
+    
+    if (status_code(response) != 200) {
+      warning(paste("API错误：", content(response, "text")))
+      return(FALSE)
+    }
+    
+    result <- content(response, "parsed")
+    answer <- tolower(trimws(result$choices[[1]]$message$content))
+    return(answer == "是")
+    
+  }, error = function(e) {
+    warning(paste("处理错误：", e$message))
+    return(FALSE)
+  })
+}
+
+# 主函数：读取文件并分析（彻底修复内容提取逻辑）
+analyze_reports <- function(file_path, api_key) {
+  if (!file.exists(file_path)) stop(paste("文件不存在：", file_path))
+  
+  # 读取并拆分报告（直接用首次拆分的内容，避免二次提取）
+  all_content <- paste(readLines(file_path, warn = FALSE), collapse = "\n")
+  report_parts <- strsplit(all_content, "========== ")[[1]]
+  report_parts <- report_parts[report_parts != ""]
+  
+  if (length(report_parts) == 0) stop("未解析出报告")
+  
+  # 提取标题和内容（直接从拆分后的片段中获取，不二次搜索）
+  results <- data.frame(
+    报告标题 = character(),
+    肺不张标记 = integer(),
+    stringsAsFactors = FALSE
+  )
+  
+  for (part in report_parts) {
+    title_end <- regexpr(" ==========\n", part)
+    if (title_end == -1) next  # 跳过格式错误的片段
+    
+    # 从拆分后的片段中直接提取标题和内容
+    title <- substr(part, 1, title_end - 1)
+    content <- substr(part, title_end + nchar(" ==========\n"), nchar(part))
+    content <- trimws(content)
+    
+    if (content != "") {
+      # 直接调用API判断
+      result <- check_atelectasis(content, api_key)
+      mark <- ifelse(result, 1, 0)
+      
+      # 记录结果
+      results <- rbind(results, data.frame(
+        报告标题 = title,
+        肺不张标记 = mark
+      ))
+      
+      # 输出进度
+      cat(paste(title, "：", mark, "\n"))
+      Sys.sleep(1)
+    }
+  }
+  
+  return(results)
+}
+
+# 主程序执行
+if (interactive()) {
+  # 配置参数
+  file_path <- "E:/xqjy.txt"
+  api_key <- "你的API密钥"  # 已填入你的API密钥
+  
+  # 检查API密钥是否有效（简单判断格式）
+  if (!grepl("^sk-", api_key)) {
+    stop("API密钥格式错误，请检查")
+  }
+  
+  # 执行分析
+  cat("开始处理报告文件：", file_path, "\n")
+  cat("共解析", length(strsplit(readLines(file_path), "========== ")[[1]])-1, "份报告，开始分析...\n\n")
+  results <- analyze_reports(file_path, api_key)
+  
+  # 输出最终结果
+  cat("\n===== 最终结果 =====", "\n")
+  print(results, row.names = FALSE)
+  
+  # 保存为txt文件（仅标题和标记，逗号分隔）
+  write.table(
+    results, 
+    "肺不张标记结果.txt", 
+    sep = ",", 
+    row.names = FALSE, 
+    col.names = FALSE, 
+    fileEncoding = "UTF-8"
+  )
+  cat("\n结果已保存至：肺不张标记结果.txt\n")
+}

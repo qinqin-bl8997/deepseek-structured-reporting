@@ -1,0 +1,337 @@
+# 胸片报告肺部阴影分析系统
+library(stringr)
+library(dplyr)
+
+# --------------------------
+# 配置参数（修改此处）
+# --------------------------
+lmstudio_path <- "D:/App/LM Studio/LM Studio.exe"  # LM Studio可执行文件路径
+model_path <- "C:/Users/Lenovo/.lmstudio/models/bartowski/HuatuoGPT-o1-8B-GGUF"  # 模型路径
+input_folder <- "E:/xqjy"  # 输入文件夹（存放所有TXT报告）
+output_file <- "E:/lung_shadow_results.txt"  # 合并输出结果文件（TXT格式）
+log_file <- "E:/lung_shadow_analysis.log"  # 详细日志文件
+max_retry <- 3  # 最大重试次数
+
+# --------------------------
+# 初始化环境
+# --------------------------
+# 创建输出文件夹
+if (!dir.exists(dirname(output_file))) {
+    dir.create(dirname(output_file), recursive = TRUE)
+}
+
+# 初始化日志文件
+if (!dir.exists(dirname(log_file))) {
+    dir.create(dirname(log_file), recursive = TRUE)
+}
+file.create(log_file)  # 清空并创建日志
+
+# 肺部阴影相关关键词（用于辅助判断）
+lung_shadow_keywords <- c(
+    "肺部阴影", "肺内阴影", "阴影", "结节影", 
+    "肿块影", "斑片影", "条索影", "团块影",
+    "高密度影", "致密影", "阴影灶", "结节状阴影",
+    "pulmonary shadow", "nodule", "mass", "infiltrate",
+    "opacity", "density shadow"
+)
+
+# 日志记录函数
+log_message <- function(message) {
+    cat(message, "\n", file = log_file, append = TRUE)
+}
+
+# --------------------------
+# 核心函数：检查模型文件是否存在
+# --------------------------
+check_model_exists <- function() {
+    cat("=== 检查模型文件 ===\n")
+    log_message("=== 检查模型文件 ===")
+    if (dir.exists(model_path)) {
+        msg <- paste0("✅ 模型文件存在: ", model_path, "\n\n")
+        cat(msg)
+        log_message(msg)
+        return(TRUE)
+    } else {
+        msg <- paste0("❌ 模型路径不存在: ", model_path, "\n")
+        cat(msg)
+        log_message(msg)
+        cat("   请修改model_path为LM Studio中模型的实际存储路径\n")
+        log_message("   请修改model_path为LM Studio中模型的实际存储路径")
+        return(FALSE)
+    }
+}
+
+# --------------------------
+# 核心函数：检查LM Studio是否可用
+# --------------------------
+check_lmstudio_installed <- function() {
+    cat("=== 检查LM Studio安装 ===\n")
+    log_message("=== 检查LM Studio安装 ===")
+    if (file.exists(lmstudio_path)) {
+        msg <- paste0("✅ LM Studio可执行文件存在: ", lmstudio_path, "\n\n")
+        cat(msg)
+        log_message(msg)
+        return(TRUE)
+    } else {
+        msg <- paste0("❌ LM Studio路径不存在: ", lmstudio_path, "\n")
+        cat(msg)
+        log_message(msg)
+        cat("   请修改lmstudio_path为LM Studio的实际安装路径\n")
+        log_message("   请修改lmstudio_path为LM Studio的实际安装路径")
+        return(FALSE)
+    }
+}
+
+# --------------------------
+# 核心函数：读取单个TXT报告
+# --------------------------
+read_single_report <- function(file_path) {
+    if (!file.exists(file_path)) {
+        error_msg <- paste0("文件不存在: ", file_path)
+        log_message(error_msg)
+        stop(error_msg)
+    }
+    
+    # 读取文件内容（支持UTF-8编码）
+    content <- readLines(file_path, warn = FALSE, encoding = "UTF-8")
+    content <- paste(content, collapse = "\n")
+    return(trimws(content))
+}
+
+# --------------------------
+# 改进的结果解析函数（判断是否存在肺部阴影）
+# --------------------------
+parse_model_output <- function(output, report_text) {
+    output_lower <- tolower(output)
+    
+    # 1. 检查标准格式输出（存在肺部阴影: 是/否）
+    if (grepl("存在肺部阴影:\\s*是", output, ignore.case = TRUE)) {
+        return(list(has_lung_shadow = TRUE, evidence = "模型明确判断存在"))
+    }
+    if (grepl("存在肺部阴影:\\s*否", output, ignore.case = TRUE)) {
+        return(list(has_lung_shadow = FALSE, evidence = "模型明确判断不存在"))
+    }
+    
+    # 2. 检查其他肯定表述（如"有肺部阴影"）
+    positive_terms <- c("存在肺部阴影", "有肺部阴影", "可见肺部阴影", 
+                       "肺内阴影", "结节影", "肿块影",
+                       "斑片影", "条索影", "团块影")
+    if (any(sapply(positive_terms, function(term) grepl(term, output, ignore.case = TRUE)))) {
+        return(list(has_lung_shadow = TRUE, evidence = "模型表述中包含肯定词汇"))
+    }
+    
+    # 3. 检查否定表述（如"未见肺部阴影"）
+    negative_terms <- c("未见肺部阴影", "无肺部阴影", "未发现肺部阴影", 
+                       "肺野清晰", "肺内未见异常密度影", "无明显阴影")
+    if (any(sapply(negative_terms, function(term) grepl(term, output, ignore.case = TRUE)))) {
+        return(list(has_lung_shadow = FALSE, evidence = "模型表述中包含否定词汇"))
+    }
+    
+    # 4. 直接检查报告原文是否包含关键词（最终兜底判断）
+    if (any(grepl(paste(lung_shadow_keywords, collapse = "|"), report_text, ignore.case = TRUE))) {
+        return(list(has_lung_shadow = TRUE, evidence = "报告原文包含肺部阴影相关关键词"))
+    }
+    
+    # 5. 所有条件都不满足时，默认判断为不存在
+    return(list(has_lung_shadow = FALSE, evidence = "未发现明确证据"))
+}
+
+# --------------------------
+# 核心函数：通过命令行调用LM Studio分析单份报告
+# --------------------------
+analyze_single_report <- function(report_text, report_filename) {
+    # 创建提示词（明确要求模型判断）
+    prompt <- paste0(
+        "你是专业的放射科医生，请分析以下胸片报告是否存在肺部阴影（包括结节影、斑片影、肿块影等）。\n",
+        "只需根据报告内容回答，不要添加额外信息。\n",
+        "输出格式必须为：\n",
+        "存在肺部阴影: 是\n",  # 或 "存在肺部阴影: 否"
+        "证据: （引用报告中支持判断的原文）\n\n",
+        "【报告内容】\n", report_text
+    )
+    
+    # 生成临时提示文件
+    prompt_file <- tempfile(fileext = ".txt")
+    writeLines(prompt, prompt_file, useBytes = TRUE)
+    
+    # 构建LM Studio命令行
+    cli_command <- paste0(
+        "\"", lmstudio_path, "\" chat ", 
+        "--model \"", model_path, "\" ",
+        "--prompt-file \"", prompt_file, "\" ",
+        "--temperature 0.05 ",  # 降低随机性，确保判断稳定
+        "--max-tokens 200 "
+    )
+    
+    # 记录提示词到日志
+    log_message(paste0("=== 报告 ", report_filename, " 提示词 ==="))
+    log_message(prompt)
+    
+    # 多次尝试调用模型
+    for (attempt in 1:max_retry) {
+        tryCatch({
+            cat(paste0("   调用模型（尝试 ", attempt, "/", max_retry, "）...\n"))
+            output <- system(cli_command, intern = TRUE)
+            output <- paste(output, collapse = "\n")
+            
+            # 记录模型原始输出到日志
+            log_message(paste0("=== 报告 ", report_filename, " 第", attempt, "次输出 ==="))
+            log_message(output)
+            
+            if (length(output) > 0) {
+                # 解析模型输出
+                parsed_result <- parse_model_output(output, report_text)
+                
+                # 清理临时文件
+                file.remove(prompt_file)
+                
+                return(list(
+                    success = TRUE,
+                    has_lung_shadow = parsed_result$has_lung_shadow,
+                    evidence = parsed_result$evidence,
+                    raw_output = output
+                ))
+            }
+        }, error = function(e) {
+            warning(paste0("命令执行错误: ", e$message, "，尝试重试（", attempt, "/", max_retry, "）"))
+            log_message(paste0("命令执行错误: ", e$message, "，尝试重试（", attempt, "/", max_retry, "）"))
+        })
+        
+        Sys.sleep(2)  # 重试前等待2秒
+    }
+    
+    # 所有尝试失败
+    file.remove(prompt_file)
+    return(list(
+        success = FALSE,
+        has_lung_shadow = FALSE,
+        evidence = "模型调用失败",
+        raw_output = "命令执行失败"
+    ))
+}
+
+# --------------------------
+# 主函数：批量处理文件夹中的所有TXT报告
+# --------------------------
+main <- function() {
+    # 记录开始时间
+    start_time <- Sys.time()
+    log_message(paste0("=== 分析开始: ", format(start_time, "%Y-%m-%d %H:%M:%S") , " ==="))
+    
+    # 1. 检查模型和LM Studio是否可用
+    if (!check_model_exists()) {
+        log_message("❌ 模型不存在，程序退出")
+        return(FALSE)
+    }
+    if (!check_lmstudio_installed()) {
+        log_message("❌ LM Studio不可用，程序退出")
+        return(FALSE)
+    }
+    
+    # 2. 获取文件夹中所有TXT文件
+    txt_files <- list.files(
+        path = input_folder,
+        pattern = "\\.txt$",  # 只匹配TXT文件
+        full.names = TRUE,   # 返回完整路径
+        ignore.case = TRUE   # 忽略大小写（如.TXT也会被匹配）
+    )
+    
+    if (length(txt_files) == 0) {
+        msg <- "❌ 输入文件夹中未找到任何TXT文件，程序退出\n"
+        cat(msg)
+        log_message(msg)
+        return(FALSE)
+    }
+    
+    # 3. 准备结果文件（使用cat函数创建并写入表头，兼容所有R版本）
+    cat("文件名,结果(1=有肺部阴影,0=无肺部阴影)\n", file = output_file, useBytes = TRUE)
+    
+    # 4. 显示待处理文件信息
+    cat(paste0("=== 发现 ", length(txt_files), " 份TXT报告，开始批量分析 ===\n"))
+    log_message(paste0("=== 发现 ", length(txt_files), " 份TXT报告，开始批量分析 ==="))
+    
+    # 5. 初始化统计变量
+    total_files <- length(txt_files)
+    success_count <- 0
+    lung_shadow_count <- 0  # 存在肺部阴影的报告数
+    fail_count <- 0         # 处理失败的报告数
+    
+    # 6. 遍历所有TXT文件并分析
+    for (i in 1:total_files) {
+        file_path <- txt_files[i]
+        file_name <- basename(file_path)  # 提取文件名（如s12345.txt）
+        cat(paste0("\n=== 分析文件 ", i, "/", total_files, "：", file_name, " ===\n"))
+        log_message(paste0("=== 分析文件 ", i, "/", total_files, "：", file_name, " ==="))
+        
+        tryCatch({
+            # 读取报告内容
+            report_text <- read_single_report(file_path)
+            cat(paste0("   报告长度: ", nchar(report_text), " 字符\n"))
+            
+            # 调用模型分析
+            analysis_result <- analyze_single_report(report_text, file_name)
+            
+            # 写入结果到合并文件（使用cat函数替代writeLines，兼容所有R版本）
+            result_value <- ifelse(analysis_result$has_lung_shadow, 1, 0)
+            result_line <- paste(file_name, result_value, sep = ",")
+            cat(result_line, "\n", file = output_file, append = TRUE, useBytes = TRUE)
+            
+            # 更新统计
+            if (analysis_result$success) {
+                success_count <- success_count + 1
+                if (analysis_result$has_lung_shadow) {
+                    lung_shadow_count <- lung_shadow_count + 1
+                }
+                cat(paste0("   分析成功，结果: ", result_value, "\n"))
+                log_message(paste0("   分析成功，结果: ", result_value, "，证据: ", analysis_result$evidence))
+            } else {
+                fail_count <- fail_count + 1
+                cat(paste0("   分析失败，默认结果: 0\n"))
+                log_message(paste0("   分析失败，默认结果: 0"))
+            }
+            
+        }, error = function(e) {
+            fail_count <- fail_count + 1
+            error_msg <- paste0("   处理文件时出错: ", e$message, "\n")
+            cat(error_msg)
+            log_message(error_msg)
+            
+            # 写入默认结果（0）
+            result_line <- paste(file_name, "0", sep = ",")
+            cat(result_line, "\n", file = output_file, append = TRUE, useBytes = TRUE)
+        })
+    }
+    
+    # 7. 输出最终统计结果
+    cat("\n=== 批量分析完成 ===\n")
+    log_message("=== 批量分析完成 ===")
+    
+    end_time <- Sys.time()
+    duration <- difftime(end_time, start_time, units = "secs")
+    
+    # 打印统计信息
+    cat(paste0("总处理文件数: ", total_files, "\n"))
+    cat(paste0("分析成功: ", success_count, " 份\n"))
+    cat(paste0("分析失败: ", fail_count, " 份\n"))
+    cat(paste0("存在肺部阴影的报告数: ", lung_shadow_count, " 份\n"))
+    cat(paste0("分析耗时: ", round(duration, 2), " 秒\n"))
+    cat(paste0("合并结果文件: ", output_file, "\n"))
+    cat(paste0("详细日志路径: ", log_file, "\n"))
+    
+    # 记录统计信息到日志
+    log_message(paste0("总处理文件数: ", total_files))
+    log_message(paste0("分析成功: ", success_count, " 份"))
+    log_message(paste0("分析失败: ", fail_count, " 份"))
+    log_message(paste0("存在肺部阴影的报告数: ", lung_shadow_count, " 份"))
+    log_message(paste0("分析耗时: ", round(duration, 2), " 秒"))
+    log_message(paste0("=== 分析结束: ", format(end_time, "%Y-%m-%d %H:%M:%S") , " ==="))
+    
+    return(TRUE)
+}
+
+# --------------------------
+# 执行主函数
+# --------------------------
+if (interactive()) {
+    main()
+}

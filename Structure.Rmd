@@ -1,0 +1,274 @@
+# 加载必要的包
+library(httr)
+library(jsonlite)
+library(stringdist)
+
+# ------------------------------
+# 1. 字符串相似度计算函数
+# ------------------------------
+similar <- function(a, b) {
+    a <- toupper(a)
+    b <- toupper(b)
+    max_len <- max(nchar(a), nchar(b))
+    if (max_len == 0) return(0)
+    1 - (stringdist(a, b, method = "lv") / max_len)
+}
+
+find_closest_key <- function(dct_keys, key, threshold = 0.75) {
+    closest_key <- NULL
+    highest_similarity <- 0
+    
+    for (k in dct_keys) {
+        if (grepl(key, k, ignore.case = TRUE)) {
+            return(k)
+        }
+    }
+    
+    for (k in dct_keys) {
+        sim <- similar(key, k)
+        if (sim > highest_similarity) {
+            highest_similarity <- sim
+            closest_key <- k
+        }
+    }
+    
+    if (highest_similarity >= threshold) closest_key else "OWN"
+}
+
+# ------------------------------
+# 2. 模型初始化函数
+# ------------------------------
+init_local_model <- function(
+        path_to_templates, 
+        model = "deepseek-chat",
+        api_base = "https://api.deepseek.com/v1",
+        api_key = NULL
+) {
+    if (!file.exists(path_to_templates)) {
+        stop(paste("模板文件不存在！路径：", path_to_templates))
+    }
+    tryCatch({
+        templates <- fromJSON(path_to_templates)
+        if (length(templates) == 0) {
+            stop("模板文件为空，请检查内容")
+        }
+    }, error = function(e) {
+        stop(paste("模板解析失败：", e$message))
+    })
+    
+    if (is.null(api_key) || !grepl("^sk-", api_key)) {
+        stop("请提供有效的DeepSeek API密钥（以sk-开头）")
+    }
+    
+    list(
+        model = model,
+        api_base = api_base,
+        api_key = api_key,
+        templates = templates,
+        templates_keys = names(templates)
+    )
+}
+
+# 提取并清理JSON
+extract_json <- function(raw_content) {
+    # 去除```标签
+    content_clean <- gsub("^\\s*```json\\s*", "", raw_content, ignore.case = TRUE)
+    content_clean <- gsub("\\s*```\\s*$", "", content_clean)
+    
+    # 提取完整JSON
+    json_pattern <- "(?s)\\{.*\\}"
+    json_match <- regmatches(
+        content_clean, 
+        regexpr(json_pattern, content_clean, perl = TRUE)
+    )
+    
+    if (length(json_match) == 0) {
+        stop("未找到有效的JSON内容")
+    }
+    
+    # 检查大括号完整性
+    pure_json <- trimws(json_match)
+    open_braces <- nchar(gsub("[^{]", "", pure_json))
+    close_braces <- nchar(gsub("[^}]", "", pure_json))
+    
+    if (open_braces != close_braces) {
+        if (close_braces == open_braces - 1) {
+            pure_json <- paste0(pure_json, "}")
+            message("已自动补全缺失的闭合大括号")
+        } else {
+            stop(paste("JSON不完整：", open_braces, "个{，", close_braces, "个}"))
+        }
+    }
+    
+    return(pure_json)
+}
+
+# ------------------------------
+# 核心功能：严格按模板结构填充内容
+# ------------------------------
+
+# 1. 创建模板的完整副本，所有值初始化为"未提及"
+create_template_skeleton <- function(template) {
+    if (is.list(template)) {
+        skeleton <- list()
+        for (field in names(template)) {
+            skeleton[[field]] <- create_template_skeleton(template[[field]])
+        }
+        return(skeleton)
+    } else {
+        return("未提及")
+    }
+}
+
+# 2. 递归匹配并填充内容
+fill_template_content <- function(skeleton, content) {
+    # 如果是叶子节点，直接替换内容
+    if (!is.list(skeleton) || !is.list(content)) {
+        return(ifelse(is.null(content) || content == "", "未提及", content))
+    }
+    
+    # 递归处理每个字段
+    for (field in names(skeleton)) {
+        # 如果内容中存在该字段，则填充；否则保留"未提及"
+        if (field %in% names(content)) {
+            skeleton[[field]] <- fill_template_content(skeleton[[field]], content[[field]])
+        }
+    }
+    
+    return(skeleton)
+}
+
+generate_structured_report <- function(
+        report_text, 
+        local_model_obj
+) {
+    max_retries <- 3
+    retry_delay <- 3
+    
+    if (!is.character(report_text) || nchar(trimws(report_text)) == 0) {
+        stop("报告文本不能为空！")
+    }
+    
+    for (i in 1:max_retries) {
+        tryCatch({
+            url <- paste0(local_model_obj$api_base, "/chat/completions")
+            headers <- c(
+                "Content-Type" = "application/json",
+                "Authorization" = paste("Bearer", local_model_obj$api_key)
+            )
+            
+            # 第一阶段：确定匹配的模板
+            system1_prompt <- paste0(
+                "任务：从提供的模板列表中选择最匹配的类型\n",
+                "模板列表：", paste(local_model_obj$templates_keys, collapse = "、"), "\n",
+                "输出格式：仅返回模板名称（无解释），不匹配则返回'OWN'\n",
+                "报告内容：", report_text
+            )
+            
+            body1 <- toJSON(list(
+                model = local_model_obj$model,
+                messages = list(
+                    list(role = "system", content = system1_prompt),
+                    list(role = "user", content = report_text)
+                ),
+                temperature = 0.0,
+                max_tokens = 50
+            ), auto_unbox = TRUE)
+            
+            response1 <- POST(url, add_headers(.headers = headers), body = body1, timeout(30))
+            stop_for_status(response1)
+            content1 <- trimws(content(response1, "parsed")$choices[[1]]$message$content)
+            cat("\n【第一阶段】匹配到模板：", content1, "\n")
+            
+            # 确定最终模板
+            target_template <- find_closest_key(local_model_obj$templates_keys, content1)
+            cat("【确认模板】", target_template, "\n")
+            
+            # 第二阶段：提取对应内容
+            if (target_template %in% local_model_obj$templates_keys) {
+                # 使用匹配到的模板结构
+                template_struct <- local_model_obj$templates[[target_template]]
+                system2_prompt <- paste0(
+                    "任务：根据以下模板提取报告内容，未提及的字段用'未提及'填充\n",
+                    "模板结构：\n", toJSON(template_struct, auto_unbox = TRUE, pretty = TRUE), "\n",
+                    "输出要求：仅返回纯JSON（无标签、无解释），严格遵循模板结构\n",
+                    "报告内容：", report_text
+                )
+            } else {
+                # 默认模板（当无匹配时）
+                template_struct <- list(
+                    INDICATION = "未提及",
+                    FINDINGS = list(DEFAULT = "未提及"),
+                    IMPRESSION = "未提及"
+                )
+                system2_prompt <- paste0(
+                    "任务：提取报告内容，未提及的字段用'未提及'填充\n",
+                    "必须包含字段：INDICATION（适应症）、FINDINGS（发现）、IMPRESSION（诊断）\n",
+                    "输出要求：仅返回纯JSON（无标签、无解释）\n",
+                    "报告内容：", report_text
+                )
+            }
+            
+            # 调用API提取内容
+            body2 <- toJSON(list(
+                model = local_model_obj$model,
+                messages = list(
+                    list(role = "system", content = system2_prompt),
+                    list(role = "user", content = report_text)
+                ),
+                temperature = 0.0,
+                max_tokens = 1000
+            ), auto_unbox = TRUE)
+            
+            response2 <- POST(url, add_headers(.headers = headers), body = body2, timeout(60))
+            stop_for_status(response2)
+            content2 <- content(response2, "parsed")$choices[[1]]$message$content
+            cat("\n【第二阶段原始响应】\n", content2, "\n")
+            
+            # 解析提取的内容
+            pure_json <- extract_json(content2)
+            extracted_content <- fromJSON(pure_json)
+            
+            # 生成最终结果：模板骨架 + 提取的内容
+            result_skeleton <- create_template_skeleton(template_struct)
+            final_result <- fill_template_content(result_skeleton, extracted_content)
+            
+            return(final_result)
+            
+        }, error = function(e) {
+            cat("\n【错误】第", i, "次尝试失败：", e$message, "\n")
+            if (i < max_retries) {
+                cat("等待", retry_delay, "秒后重试...\n")
+                Sys.sleep(retry_delay)
+            } else {
+                stop("已达最大重试次数，请检查API配置或报告格式")
+            }
+        })
+    }
+}
+
+# ------------------------------
+# 主程序
+# ------------------------------
+
+cat("===== 初始化配置 =====\n")
+local_model_config <- init_local_model(
+    path_to_templates = "gpt4-structured-reporting-main/static/report_templates.json",
+    api_key = "替换为实际API密钥"  # 替换为实际API密钥
+)
+
+report_text <- "右膝关节 MRI 平扫显示股骨远端、胫骨近端及髌骨骨质信号未见明显异常，关节软骨连续光滑，内侧半月板后角见线样高信号未达关节面（I-II 级退变），外侧半月板形态信号正常，前后交叉韧带及内外侧副韧带连续性良好，关节腔少量长 T2 信号影，髌上囊及腘窝结构未见异常；印象：内侧半月板后角退变，关节腔少量积液，余结构未见明显异常。
+"
+
+cat("\n===== 生成结构化报告 =====\n")
+structured_result <- generate_structured_report(
+    report_text = report_text,
+    local_model_obj = local_model_config
+)
+
+cat("\n===== 结果 =====\n")
+print(structured_result)
+
+write_json(structured_result, "structured_report.json", 
+           auto_unbox = TRUE, pretty = TRUE, ensure_ascii = FALSE)
+cat("\n结果已保存至 structured_report.json\n")
